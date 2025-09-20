@@ -1,16 +1,25 @@
-# backend/api/views.py
 from decimal import Decimal
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.models import User
+from django.core.mail import send_mail
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import Expense, Split
-from .serializers import UserSerializer, ExpenseSerializer
+from .models import Expense, Split, Friendship, Group
+from .serializers import (
+    UserSerializer,
+    ExpenseSerializer,
+    FriendshipSerializer,
+    GroupSerializer,
+)
 
+
+# -------------------------
+# User Endpoints
+# -------------------------
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -22,34 +31,33 @@ def me(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def users(request):
-    """List all users (simple directory for now)."""
+    """List all users."""
     qs = User.objects.order_by("username")
     return Response(UserSerializer(qs, many=True).data)
 
+
+# -------------------------
+# Summary & Balances
+# -------------------------
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def summary(request):
     """
-    Simple global summary for the logged-in user.
-    Uses Split rows when available; falls back to a naive total otherwise.
+    Global summary for the logged-in user.
+    Uses splits when available; falls back to naive totals.
     """
     user = request.user
     owed_by_me = Decimal("0")
     owed_to_me = Decimal("0")
 
-    # Prefer splits: each split represents "user owes payer <amount>"
     for s in Split.objects.select_related("expense", "expense__paid_by", "user"):
-        payer = s.expense.paid_by
-        ower = s.user
-        amt = Decimal(s.amount)
-
+        payer, ower, amt = s.expense.paid_by, s.user, Decimal(s.amount)
         if payer.id == user.id and ower.id != user.id:
             owed_to_me += amt
         elif ower.id == user.id and payer.id != user.id:
             owed_by_me += amt
 
-    # If there are *no* splits yet, fall back to "who paid" (your early demo logic)
     if owed_by_me == 0 and owed_to_me == 0:
         for exp in Expense.objects.all():
             if exp.paid_by_id == user.id:
@@ -66,94 +74,19 @@ def summary(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def recent_expenses(request):
-    """Return recent expenses (paged/limited)."""
-    expenses = Expense.objects.order_by("-date")[:20]
-    return Response({"results": ExpenseSerializer(expenses, many=True).data})
-
-
-@csrf_exempt
-@api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
-def expenses(request):
-    """
-    GET: list expenses.
-    POST: create an expense. JSON:
-      {
-        "description": "Dinner",
-        "amount": 60,
-        "splits": [ { "user_id": 2, "amount": 30 }, { "user_id": 3, "amount": 30 } ]   # optional
-      }
-    """
-    if request.method == "GET":
-        qs = Expense.objects.order_by("-date")[:50]
-        return Response({"results": ExpenseSerializer(qs, many=True).data})
-
-    # POST path
-    desc = (request.data.get("description") or "").strip()
-    amount = request.data.get("amount", 0)
-    splits_data = request.data.get("splits", [])
-
-    if not desc:
-        return Response({"error": "description required"}, status=status.HTTP_400_BAD_REQUEST)
-
-    try:
-        amount = Decimal(str(amount))
-    except Exception:
-        return Response({"error": "amount must be a number"}, status=status.HTTP_400_BAD_REQUEST)
-
-    exp = Expense.objects.create(description=desc, amount=amount, paid_by=request.user)
-
-    # Optional splits
-    total_split = Decimal("0")
-    if isinstance(splits_data, list):
-        for s in splits_data:
-            try:
-                uid = int(s.get("user_id"))
-                split_amount = Decimal(str(s.get("amount")))
-                split_user = User.objects.get(pk=uid)
-            except Exception:
-                continue
-            exp.splits.create(user=split_user, amount=split_amount)
-            total_split += split_amount
-
-    # We still return the expense even if splits don't sum perfectly,
-    # but we include a 'warning' key to help the client.
-    payload = ExpenseSerializer(exp).data
-    if total_split and total_split != amount:
-        payload = {**payload, "warning": "Split amounts do not match total expense"}
-
-    return Response(payload, status=status.HTTP_201_CREATED)
-
-
-# NEW: per-friend balances, like Splitwise "you owe" / "you are owed"
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
 def balances(request):
     """
-    Compute per-counterparty net balances using Split rows.
-    Positive amount => they owe *you*; negative => you owe *them*.
-    Response:
-    {
-      "you_are_owed": [ { "user": {...}, "amount": 55.2 }, ... ],
-      "you_owe":      [ { "user": {...}, "amount": 12.0 }, ... ],
-      "totals": { "to_me": 123.45, "by_me": 67.89, "net": 55.56 }
-    }
+    Per-friend balances using splits.
+    Positive => they owe you, Negative => you owe them.
     """
     me = request.user
     net_by_user: dict[int, Decimal] = {}
 
     qs = Split.objects.select_related("expense", "expense__paid_by", "user")
     for s in qs:
-        payer = s.expense.paid_by
-        ower = s.user
-        amt = Decimal(s.amount)
-
-        # If I'm the payer, other users owe me their split amounts
-        if payer_id := payer.id == me.id and ower.id != me.id:
+        payer, ower, amt = s.expense.paid_by, s.user, Decimal(s.amount)
+        if payer.id == me.id and ower.id != me.id:
             net_by_user[ower.id] = net_by_user.get(ower.id, Decimal("0")) + amt
-
-        # If I'm the one who owes, I owe the payer
         elif ower.id == me.id and payer.id != me.id:
             net_by_user[payer.id] = net_by_user.get(payer.id, Decimal("0")) - amt
 
@@ -171,9 +104,8 @@ def balances(request):
             total_to_me += net
         elif net < 0:
             you_owe.append(entry)
-            total_by_me += -net  # store as positive
+            total_by_me += -net
 
-    # sort largest first
     you_are_owed.sort(key=lambda x: -x["amount"])
     you_owe.sort(key=lambda x: -x["amount"])
 
@@ -186,3 +118,150 @@ def balances(request):
             "net": round(float(total_to_me - total_by_me), 2),
         }
     })
+
+
+# -------------------------
+# Expenses
+# -------------------------
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def recent_expenses(request):
+    """Return recent expenses (paged/limited)."""
+    expenses = Expense.objects.order_by("-date")[:20]
+    return Response({"results": ExpenseSerializer(expenses, many=True).data})
+
+
+@csrf_exempt
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def expenses(request):
+    """
+    GET: list expenses.
+    POST: create an expense with optional splits.
+    """
+    if request.method == "GET":
+        qs = Expense.objects.order_by("-date")[:50]
+        return Response({"results": ExpenseSerializer(qs, many=True).data})
+
+    desc = (request.data.get("description") or "").strip()
+    amount = request.data.get("amount", 0)
+    paid_by_id = request.data.get("paid_by") or request.data.get("paid_by_id")
+    splits_data = request.data.get("splits", [])
+
+    if not desc:
+        return Response({"error": "description required"}, status=400)
+
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return Response({"error": "amount must be a number"}, status=400)
+
+    if paid_by_id:
+        try:
+            payer = User.objects.get(pk=int(paid_by_id))
+        except (User.DoesNotExist, ValueError):
+            return Response({"error": "paid_by must be valid"}, status=400)
+    else:
+        payer = request.user
+
+    exp = Expense.objects.create(description=desc, amount=amount, paid_by=payer)
+
+    for split in splits_data:
+        try:
+            split_user = User.objects.get(pk=int(split["user"]))
+            Split.objects.create(expense=exp, user=split_user, amount=float(split["amount"]))
+        except Exception as e:
+            return Response({"error": f"invalid split: {e}"}, status=400)
+
+    return Response(ExpenseSerializer(exp).data, status=201)
+
+
+# -------------------------
+# Friendships
+# -------------------------
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def add_friend(request):
+    """Send a friend request or invite by email."""
+    email = request.data.get("email")
+    if not email:
+        return Response({"error": "Email required"}, status=400)
+
+    try:
+        to_user = User.objects.get(email=email)
+        if Friendship.objects.filter(from_user=request.user, to_user=to_user).exists():
+            return Response({"error": "Friend request already sent"}, status=400)
+
+        friendship = Friendship.objects.create(from_user=request.user, to_user=to_user)
+        return Response(FriendshipSerializer(friendship).data, status=201)
+
+    except User.DoesNotExist:
+        send_mail(
+            "You’ve been invited to SplitNice!",
+            f"{request.user.username} invited you to join SplitNice. Sign up with {email}.",
+            "noreply@splitnice.com",
+            [email],
+        )
+        return Response({"message": "Invite sent via email"}, status=200)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_friends(request):
+    """List all friendships for the logged-in user."""
+    qs = Friendship.objects.filter(from_user=request.user) | Friendship.objects.filter(to_user=request.user)
+    return Response(FriendshipSerializer(qs, many=True).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def accept_friend(request, friendship_id):
+    """Accept a pending friend request."""
+    try:
+        friendship = Friendship.objects.get(pk=friendship_id, to_user=request.user)
+    except Friendship.DoesNotExist:
+        return Response({"error": "Friend request not found"}, status=404)
+
+    friendship.accepted = True
+    friendship.save()
+    return Response(FriendshipSerializer(friendship).data)
+
+
+# -------------------------
+# Groups
+# -------------------------
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def create_group(request):
+    """
+    Create a group with members.
+    {
+      "name": "Apartment 6307",
+      "member_ids": [2, 3, 4]
+    }
+    """
+    name = request.data.get("name")
+    member_ids = request.data.get("member_ids", [])
+
+    if not name:
+        return Response({"error": "Group name required"}, status=400)
+
+    group = Group.objects.create(name=name)
+    group.members.add(request.user)
+
+    if member_ids:
+        users = User.objects.filter(id__in=member_ids)
+        group.members.add(*users)
+
+    return Response(GroupSerializer(group).data, status=201)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_groups(request):
+    """List groups for the logged-in user."""
+    qs = Group.objects.filter(members=request.user).order_by("name")
+    return Response(GroupSerializer(qs, many=True).data)
